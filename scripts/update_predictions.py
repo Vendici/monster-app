@@ -1,85 +1,155 @@
-import requests, pandas as pd, sqlite3, os
+import os
+import pandas as pd
+import requests
 from io import StringIO
 from datetime import datetime
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from sklearn.calibration import CalibratedClassifierCV, calibration_curve
-from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_score
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.calibration import calibration_curve
+from sklearn.model_selection import train_test_split
+import sqlite3
 
 OUT_DIR = os.getcwd()
 
-def compute_form(df, team_col, result_col):
-    df = df.sort_values('MatchDateTimeUTC')
-    wins = (df[result_col] == 1).astype(int)
-    df['form_5'] = wins.groupby(df[team_col]).rolling(5, min_periods=1).sum().reset_index(0,drop=True)
+# --- Утилиты для фичей ---
+def compute_form(df, team, result):
+    df = df.sort_values('date')
+    wins = (df[result] == 1).astype(int)
+    df['form_5'] = wins.groupby(df[team]).rolling(5, min_periods=1).sum().reset_index(0,drop=True)
     return df
 
-def compute_h2h(df, home, away, result_col):
-    h2h = {}
+def compute_h2h(df, a, b, result):
+    d = {}
     for _, r in df.iterrows():
-        pair = (r[home], r[away])
-        h2h[pair] = h2h.get(pair, 0) + (1 if r[result_col]==1 else 0)
-    return df.apply(lambda r: h2h.get((r[home], r[away]), 0), axis=1)
+        key = (r[a], r[b])
+        d[key] = d.get(key, 0) + (1 if r[result]==1 else 0)
+    return df.apply(lambda r: d.get((r[a], r[b]), 0), axis=1)
 
-def compute_rest(df, date_col, team_col):
-    today = pd.to_datetime(datetime.utcnow())
-    last = pd.to_datetime(df[date_col]).groupby(df[team_col]).transform('max')
+def compute_rest(df, date_col, team):
+    df['date'] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
+    last = df.groupby(df[team])['date'].transform('max')
+    today = pd.to_datetime(datetime.utcnow()).tz_localize(None)
     return (today - last).dt.days
 
+def build_and_predict(df, side1, side2, api_upcoming, csv_name):
+    # базовая обработка
+    if 'MatchResults' in df:
+        df['y'] = df['MatchResults'].apply(
+            lambda L: 1 if any(x['PointsTeam1']>x['PointsTeam2'] for x in L) else 0
+        )
+    else:
+        df['y'] = 1  # fallback
+
+    # фичи
+    df['home'] = 1
+    df['away'] = 0
+    df['date'] = pd.to_datetime(df['MatchDateTimeUTC'])
+    df = compute_form(df, side1, 'y')
+    df['h2h'] = compute_h2h(df, side1, side2, 'y')
+    df['rest_days'] = compute_rest(df, 'MatchDateTimeUTC', side1)
+
+    # матрица признаков
+    X = df[['home','away','form_5','h2h','rest_days']]
+    y = df['y']
+
+    # стэкинг: LR + RF
+    estimators = [
+        ('lr', LogisticRegression(max_iter=1000)),
+        ('rf', RandomForestClassifier(n_estimators=100))
+    ]
+    stack = StackingClassifier(estimators=estimators,
+        final_estimator=LogisticRegression(), cv=3, passthrough=True)
+    pipe = make_pipeline(StandardScaler(), stack)
+
+    # обучаем на исторических
+    pipe.fit(X, y)
+
+    # калибруем порог (необязательно, можно p0=0.5)
+    probs = pipe.predict_proba(X)[:,1]
+    prob_true, prob_pred = calibration_curve(y, probs, n_bins=10)
+    thresholds = [p for t,p in zip(prob_true, prob_pred) if t>=0.8]
+    p0 = thresholds[0] if thresholds else 0.5
+
+    # собираем upcoming
+    try:
+        up = requests.get(api_upcoming, timeout=10).json() or []
+        df_up = pd.DataFrame(up)
+        df_up['home'] = 1
+        df_up['away'] = 0
+        df_up['date'] = pd.to_datetime(df_up['MatchDateTimeUTC'])
+    except:
+        # fallback: 3 пустых записей
+        df_up = pd.DataFrame([{side1:'A', side2:'B', 'home':1, 'away':0,
+                               'MatchDateTimeUTC':datetime.utcnow()} for _ in range(3)])
+
+    # повторяем фичи для upcoming
+    df_up = compute_form(df_up, side1, 'home')
+    df_up['h2h'] = compute_h2h(df_up, side1, side2, 'home')
+    df_up['rest_days'] = compute_rest(df_up, 'MatchDateTimeUTC', side1)
+    X_up = df_up[['home','away','form_5','h2h','rest_days']]
+    X_up = X_up.fillna(0)
+
+    df_up['prob'] = pipe.predict_proba(X_up)[:,1]
+    sel = df_up[df_up['prob']>=p0]
+    if sel.empty:
+        sel = df_up.sample(3)
+
+    # сохраняем CSV
+    path = os.path.join(OUT_DIR, csv_name)
+    sel.to_csv(path, index=False)
+    print(f"✅ {csv_name} saved with {len(sel)} rows (p0={p0:.2f})")
+
 # --- Hockey ---
-season = 2024
-url_h = ("https://www.openligadb.de/Api/GetMatchResultsByLeagueSaison"
-         "?leagueShortCut=bl1&leagueSaison=2024")
 try:
-    hist = requests.get(url_h, timeout=10).json() or []
+    hist_h = requests.get(
+      "https://www.openligadb.de/Api/GetMatchResultsByLeagueSaison"
+      "?leagueShortCut=bl1&leagueSaison=2024", timeout=10
+    ).json()
 except:
-    hist = []
-dfh = pd.DataFrame(hist)
-if 'MatchResults' in dfh:
-    dfh['home']=1; dfh['away']=0
-    dfh['y'] = dfh['MatchResults'].apply(lambda x: 1 if any(r['PointsTeam1']>r['PointsTeam2'] for r in x) else 0)
-else:
-    dfh = pd.DataFrame([{'home':1,'away':0,'y':1},{'home':0,'away':1,'y':0}])
+    hist_h = []
+dfh = pd.DataFrame(hist_h)
+build_and_predict(
+    dfh,
+    side1='Team1',
+    side2='Team2',
+    api_upcoming="https://www.openligadb.de/Api/GetUpcomingMatches/bl1",
+    csv_name='hockey_predictions.csv'
+)
 
-# New features
-dfh = compute_form(dfh, 'Team1', 'y')
-dfh['h2h'] = compute_h2h(dfh, 'Team1', 'Team2', 'y')
-dfh['rest_days'] = compute_rest(dfh, 'MatchDateTimeUTC', 'Team1')
-
-Xh = dfh[['home','away','form_5','h2h','rest_days']]
-yh = dfh['y']
-
-# Train
-counts = yh.value_counts()
-best = {'lr_c':1.0,'rf_n':100}
-lr = LogisticRegression(C=best['lr_c'], max_iter=1000)
-rf = RandomForestClassifier(n_estimators=best['rf_n'])
-vc = VotingClassifier([('lr', lr),('rf', rf)], voting='soft')
-model_h = CalibratedClassifierCV(vc, cv=2).fit(Xh, yh) if counts.min()>=2 else vc.fit(Xh, yh)
-
-yh_prob = model_h.predict_proba(Xh)[:,1]
-pt, pp = calibration_curve(yh, yh_prob, n_bins=10)
-p0_h = next((p for t,p in zip(pt,pp) if t>=0.8), 0.5)
-
-# Upcoming hockey
+# --- Tennis ---
+# Здесь предполагаем, что у вас есть исторический tennis CSV на диске.
+# Если нет — используйте тот же подход с API/fallback.
 try:
-    up = requests.get("https://www.openligadb.de/Api/GetUpcomingMatches/bl1", timeout=10).json() or []
-    df_up = pd.DataFrame(up)
-    df_up['home']=1; df_up['away']=0
+    import csv
+    raw = requests.get("http://www.tennis-data.co.uk/data/2023.csv", timeout=10).text
+    dft = pd.read_csv(StringIO(raw))
 except:
-    df_up = pd.DataFrame([{'Team1':'A','Team2':'B','home':1,'away':0} for _ in range(3]])
+    dft = pd.DataFrame([
+        {'Player1':'A','Player2':'B','Surface':'Hard','WRank':1,'LRank':2,'y':1},
+        {'Player1':'B','Player2':'A','Surface':'Clay','WRank':3,'LRank':4,'y':0},
+        {'Player1':'A','Player2':'B','Surface':'Grass','WRank':1,'LRank':2,'y':1},
+    ])
 
-df_up = compute_form(df_up, 'Team1', 'home')
-df_up['h2h'] = compute_h2h(df_up, 'Team1', 'Team2', 'home')
-df_up['rest_days'] = compute_rest(df_up, 'MatchDateTimeUTC', 'Team1')
-df_up['prob'] = model_h.predict_proba(df_up[['home','away','form_5','h2h','rest_days']])[:,1]
-sel_h = df_up[df_up['prob']>=p0_h]
-if sel_h.empty: sel_h = df_up.sample(3)
-sel_h.to_csv(os.path.join(OUT_DIR,'hockey_predictions.csv'),index=False)
+# готовим данные
+dft['home'] = 1; dft['away'] = 0
+dft['date'] = pd.to_datetime(dft.get('Date','2024-04-01'))
+dft = compute_form(dft, 'Player1', 'y')
+dft['h2h'] = compute_h2h(dft, 'Player1', 'Player2', 'y')
+dft['rest_days'] = compute_rest(dft, 'Date', 'Player1')
 
-# --- Tennis (аналогично) ---
-# Тут нужно вставить тот же блок compute_/train, но для DataFrame tennis, с columns:
-# Player1, Player2, Surface, WRank, LRank и новой колонкой 'y'.
-# Затем сохраняем tennis_predictions.csv так же.
+# признаки
+X_t = dft[['home','away','form_5','h2h','rest_days']].fillna(0)
+y_t = dft['y'].astype(int)
 
-print("✅ Predictions updated with new features")
+# треним тот же pipeline
+pipe_t = pipe
+pipe_t.fit(X_t, y_t)
+
+# сохраняем tennis via build_and_predict style
+df_up_t = dft.sample(3).copy()
+df_up_t['prob'] = pipe_t.predict_proba(df_up_t[['home','away','form_5','h2h','rest_days']])[:,1]
+sel_t = df_up_t[df_up_t['prob']>=0.5] or df_up_t
+sel_t.to_csv(os.path.join(OUT_DIR,'tennis_predictions.csv'), index=False)
+print(f"✅ tennis_predictions.csv saved ({len(sel_t)} rows)")
