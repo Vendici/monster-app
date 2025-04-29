@@ -2,7 +2,7 @@ name: Hourly Update Predictions
 
 on:
   schedule:
-    - cron: '0 * * * *'    # каждый час
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -19,15 +19,15 @@ jobs:
 
     - name: Установить зависимости
       run: |
-        pip install requests pandas scikit-learn optuna
+        pip install requests pandas scikit-learn
 
     - name: Обновить прогнозы
       run: python scripts/update_predictions.py
 
-    - name: Пуш изменений в gh-pages
+    - name: Пуш изменений
       run: |
         git config user.name 'github-actions'
         git config user.email 'actions@github.com'
         git add hockey_predictions.csv tennis_predictions.csv
-        git commit -m 'Hourly update'
-        git push origin gh-pages --force
+        git commit -m 'Hourly update with new features'
+        git push origin main --force
