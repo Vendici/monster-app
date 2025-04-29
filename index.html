@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Monster V∞ Ultra</title>
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+<style>body{font-family:Arial,sans-serif;padding:1rem;}h1{text-align:center;}
+.tab{display:inline-block;margin-right:1rem;cursor:pointer;padding:.5rem;background:#eee;border-radius:4px;}
+.active{background:#ddd;font-weight:bold;}table{width:100%;border-collapse:collapse;margin-top:1rem;}
+th,td{border:1px solid #ccc;padding:.5rem;text-align:center;}</style>
+</head><body>
+<h1>🤖 Monster V∞ Ultra</h1>
+<div><span id="tab-h" class="tab active">Хоккей</span><span id="tab-t" class="tab">Теннис</span></div>
+<div id="table-container"></div>
+<script>
+const container=document.getElementById('table-container');
+function loadCSV(f){Papa.parse(f,{header:true,download:true,complete:r=>{const d=r.data; if(!d.length){container.innerHTML='<p>Нет данных</p>';return;}
+const cols=Object.keys(d[0]), rows=d.map(rw=>'<tr>'+cols.map(c=>`<td>${rw[c]||''}</td>`).join('')+'</tr>');
+container.innerHTML=`<table><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr>${rows.join('')}</table>`;} });}
+function tabSwitch(id,file){document.getElementById('tab-h').classList.remove('active');document.getElementById('tab-t').classList.remove('active');
+document.getElementById('tab-'+id).classList.add('active');loadCSV(file);}
+document.getElementById('tab-h').onclick=()=>tabSwitch('h','hockey_predictions.csv');
+document.getElementById('tab-t').onclick=()=>tabSwitch('t','tennis_predictions.csv');
+loadCSV('hockey_predictions.csv');
+</script></body></html>

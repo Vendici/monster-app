@@ -1,0 +1,4 @@
+Player1,Player2,Surface,rank_diff,surf_Clay,surf_Grass,surf_Hard,prob
+A,B,Hard,0,False,False,True,0.4999997238826018
+C,D,Clay,0,True,False,False,0.6092785272748839
+E,F,Grass,0,False,True,False,0.36977614151527505
